@@ -15,12 +15,14 @@ ADMIN_ID = [5544288619]
 
 SCAN_DEADLINE = 45
 MAX_CONCURRENT_SCANS = 1
+MAX_MASS_SITES = 300          # txt တစ်ခုထဲ ဘယ်နှစ်ကောင်အထိ ခွင့်ပြုမလဲ
 
-# connect မလုပ်သေးဘူး — object ပဲ ဖန်တီးထားတယ် (loop fix)
 bot = TelegramClient('scanner_bot', API_ID, API_HASH)
 SEM = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
 PW = None
 BROWSER = None
+
+MASS = {"running": False, "stopped": False}
 
 
 # ── access ──────────────────────────────────────────────
@@ -180,7 +182,8 @@ async def probe_host(host: str) -> dict:
 
 
 # ── the scanner ─────────────────────────────────────────
-async def scan_site(url: str) -> str:
+async def scan_site(url: str):
+    """returns (report_html, hit_bool)"""
     async with SEM:
         context = await BROWSER.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -213,7 +216,11 @@ async def scan_site(url: str) -> str:
             html = await page.content()
             cookies = await context.cookies()
 
-            card_form = any(await page.query_selector(s) for s in CARD_DOM_SELECTORS)
+            card_form = False
+            for sel in CARD_DOM_SELECTORS:
+                if await page.query_selector(sel):
+                    card_form = True
+                    break
 
             runtime_blob = await page.evaluate(
                 """() => {
@@ -252,6 +259,8 @@ async def scan_site(url: str) -> str:
         f"{p}: <code>{hits[0][:32]}</code>" + (f" +{len(hits)-1}" if len(hits) > 1 else "")
         for p, hits in keys.items()) or "  ❌ Nᴏɴᴇ ғᴏᴜɴᴅ"
 
+    hit = bool(gateways) or bool(keys)
+
     captcha = next((n for n in ["reCAPTCHA", "hCaptcha", "Turnstile"]
                     if n.lower() in blob["req"] or n.lower() in h_low), "None")
     cloudflare = "Cloudflare" if (
@@ -269,8 +278,8 @@ async def scan_site(url: str) -> str:
     gw_str = "\n".join(
         f"  {n} {'⚡ net' if net else '· html'}" for n, net in gateways) or "  ❌ Nᴏɴᴇ"
 
-    return f"""∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼
-   Sɪᴛᴇ Sᴄᴀɴɴᴇʀ  ·  ᴅᴇᴇᴘ ᴍᴏᴅᴇ
+    report = f"""∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼
+   Sɪᴛᴇ Sᴄᴀɴɴᴇʀ  ·  {'💥 ʜɪᴛ' if hit else '· ᴍɪss'}
 ∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼
 🌐 <b>URL:</b> <code>{host}</code>
 📡 <b>Sᴛᴀᴛᴜs:</b> <code>{status}</code>  ·  ⏱️ <code>{elapsed}ms</code>
@@ -297,6 +306,66 @@ async def scan_site(url: str) -> str:
 📍 <b>SAN:</b> {', '.join(probe['san']) or 'N/A'}
 ∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼
 💡 Mᴀᴅᴇ ʙʏ @AFUONA_V"""
+    return report, hit
+
+
+# ── mass worker ─────────────────────────────────────────
+def normalize(line: str) -> str:
+    u = line.strip()
+    if not u or u.startswith('#'):
+        return ""
+    if not u.startswith('http'):
+        u = f'https://{u}'
+    return u
+
+
+async def mass_worker(event, urls: list):
+    total = len(urls)
+    hits = 0
+    errors = 0
+    t0 = time.monotonic()
+
+    progress = await event.reply(
+        f"🚀 Mᴀss sᴄᴀɴ sᴛᴀʀᴛᴇᴅ\n📊 <code>0/{total}</code> · 💥 <code>0</code> ʜɪᴛs · ❌ <code>0</code> ᴇʀʀ",
+        parse_mode='html')
+
+    for i, u in enumerate(urls, 1):
+        if MASS["stopped"]:
+            break
+        try:
+            report, hit = await asyncio.wait_for(scan_site(u), SCAN_DEADLINE)
+            if hit:
+                hits += 1
+            await event.reply(report, parse_mode='html')     # ← real-time, တစ်ခုချင်း
+        except asyncio.TimeoutError:
+            errors += 1
+            await event.reply(f"❌ <code>{u}</code>\n⏱️ ᴅᴇᴀᴅʟɪɴᴇ ᴇxᴄᴇᴇᴅᴇᴅ ({SCAN_DEADLINE}s)", parse_mode='html')
+        except Exception as e:
+            errors += 1
+            await event.reply(f"❌ <code>{u}</code>\n{type(e).__name__}: {e}", parse_mode='html')
+
+        bar = "█" * int(i / total * 20) + "░" * (20 - int(i / total * 20))
+        try:
+            await progress.edit(
+                f"🚀 Mᴀss sᴄᴀɴ {'🛑 sᴛᴏᴘᴘᴇᴅ' if MASS['stopped'] else 'ʀᴜɴɴɪɴɢ'}\n"
+                f"<code>{bar}</code>\n"
+                f"📊 <code>{i}/{total}</code> · 💥 <code>{hits}</code> ʜɪᴛs · ❌ <code>{errors}</code> ᴇʀʀ",
+                parse_mode='html')
+        except Exception:
+            pass
+
+    mins = (time.monotonic() - t0) / 60
+    await progress.edit(
+        f"✅ Mᴀss sᴄᴀɴ {'sᴛᴏᴘᴘᴇᴅ' if MASS['stopped'] else 'ᴄᴏᴍᴘʟᴇᴛᴇᴅ'}\n"
+        f"∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼\n"
+        f"📊 Sᴄᴀɴɴᴇᴅ: <code>{i}/{total}</code>\n"
+        f"💥 Hɪᴛs: <code>{hits}</code>\n"
+        f"❌ Eʀʀᴏʀs: <code>{errors}</code>\n"
+        f"⏱️ Tɪᴍᴇ: <code>{mins:.1f} min</code>\n"
+        f"∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼∼",
+        parse_mode='html')
+    MASS["running"] = False
+    MASS["stopped"] = False
 
 
 # ── telegram handlers ───────────────────────────────────
@@ -322,26 +391,89 @@ async def scg(event):
 
     status_msg = await event.reply(f"🔍 Dᴇᴇᴘ sᴄᴀɴɴɪɴɢ <code>{url}</code>...", parse_mode='html')
     try:
-        result = await asyncio.wait_for(scan_site(url), SCAN_DEADLINE)
-        await status_msg.edit(result, parse_mode='html')
+        report, _ = await asyncio.wait_for(scan_site(url), SCAN_DEADLINE)
+        await status_msg.edit(report, parse_mode='html')
     except asyncio.TimeoutError:
         await status_msg.edit(f"❌ Sᴄᴀɴ ᴅᴇᴀᴅʟɪɴᴇ ᴇxᴄᴇᴇᴅᴇᴅ ({SCAN_DEADLINE}s)", parse_mode='html')
     except Exception as e:
         await status_msg.edit(f"❌ Eʀʀᴏʀ: {type(e).__name__}: {e}", parse_mode='html')
 
 
+@bot.on(events.NewMessage(pattern=r'^/mass'))
+async def mass(event):
+    if not is_premium(event.sender_id):
+        await event.reply("❌ Aᴄᴄᴇss Dᴇɴɪᴇᴅ\n\nOɴʟʏ ᴘʀᴇᴍɪᴜᴍ ᴜsᴇʀs ᴄᴀɴ ᴜsᴇ ᴛʜɪs.", parse_mode='html')
+        return
+
+    if MASS["running"]:
+        await event.reply("⏳ Mᴀss sᴄᴀɴ ᴀʟʀᴇᴀᴅʏ ʀᴜɴɴɪɴɢ. Usᴇ <code>/stop</code> ғɪʀsᴛ.", parse_mode='html')
+        return
+
+    # txt file ကို caption နဲ့ ပို့ သို့ reply ပြန်ပြီး ပို့ — နှစ်မျိုးလုံး ကောင်း
+    msg = event.message
+    if not msg.media and msg.reply_to:
+        msg = await msg.get_reply_message()
+
+    if not msg or not msg.media:
+        await event.reply(
+            "📝 Usᴀɢᴇ:\n"
+            "1. <code>sites.txt</code> ဖိုင် ပို့ (site တစ်ကောင် တစ်ကြောင်း)\n"
+            "2. caption ထဲ <code>/mass</code> ရိုက် — သို့ ဖိုင်ကို reply ပြန်ပြီး <code>/mass</code>\n\n"
+            "Ꭼxᴀᴍᴘʟᴇ sites.txt:\n"
+            "<code>example.com\nhttps://shop.example.org\n# comment ကျော်မယ်</code>",
+            parse_mode='html')
+        return
+
+    try:
+        raw = await bot.download_media(msg, bytes)
+        text = raw.decode('utf-8', errors='ignore')
+    except Exception as e:
+        await event.reply(f"❌ Fɪʟᴇ ᴅᴏᴡɴʟᴏᴀᴅ ғᴀɪʟᴇᴅ: {e}", parse_mode='html')
+        return
+
+    urls = []
+    for line in text.splitlines():
+        u = normalize(line)
+        if u:
+            urls.append(u)
+
+    if not urls:
+        await event.reply("❌ Fɪʟᴇ ᴇᴍᴘᴛʏ — ʙᴏᴛ ғᴏᴜɴᴅ ɴᴏ sɪᴛᴇs.", parse_mode='html')
+        return
+
+    if len(urls) > MAX_MASS_SITES:
+        urls = urls[:MAX_MASS_SITES]
+
+    MASS["running"] = True
+    MASS["stopped"] = False
+    asyncio.create_task(mass_worker(event, urls))
+
+
+@bot.on(events.NewMessage(pattern=r'^/stop'))
+async def stop(event):
+    if not is_premium(event.sender_id):
+        return
+    if MASS["running"]:
+        MASS["stopped"] = True
+        await event.reply("🛑 Mᴀss sᴄᴀɴ sᴛᴏᴘᴘɪɴɢ ᴀғᴛᴇʀ ᴄᴜʀʀᴇɴᴛ sɪᴛᴇ...", parse_mode='html')
+    else:
+        await event.reply("💤 Nᴏᴛʜɪɴɢ ʀᴜɴɴɪɴɢ.", parse_mode='html')
+
+
 @bot.on(events.NewMessage(pattern=r'^/start'))
 async def start(event):
-    await event.reply("👋 <b>Deep Site Scanner</b>\n\n"
-                      "├─ <code>/scg &lt;URL&gt;</code> → ʀᴇɴᴅᴇʀ + ɴᴇᴛᴡᴏʀᴋ + ᴛʟs sᴄᴀɴ\n"
-                      "└─ sᴇʀᴠᴇᴅ ғʀᴏᴍ ʀᴀɪʟᴡᴀʏ · ᴘᴏᴡᴇʀᴇᴅ ʙʏ ᴘʟᴀʏᴡʀɪɢʜᴛ",
-                      parse_mode='html')
+    await event.reply(
+        "👋 <b>Deep Site Scanner</b>\n\n"
+        "├─ <code>/scg &lt;URL&gt;</code> → sɪɴɢʟᴇ sɪᴛᴇ ᴅᴇᴇᴘ sᴄᴀɴ\n"
+        "├─ <code>/mass</code> + txt ғɪʟᴇ → ʙᴜʟᴋ sᴄᴀɴ, ʀᴇsᴜʟᴛs ʟɪᴠᴇ\n"
+        "└─ <code>/stop</code> → sᴛᴏᴘ ᴍᴀss sᴄᴀɴ\n\n"
+        "sᴇʀᴠᴇᴅ ғʀᴏᴍ ʀᴀɪʟᴡᴀʏ · ᴘᴏᴡᴇʀᴇᴅ ʙʏ ᴘʟᴀʏᴡʀɪɢʜᴛ",
+        parse_mode='html')
 
 
 async def main():
     global PW, BROWSER
 
-    # loop fix — connect ကို ဒီထဲမှာပဲ လုပ်တယ်
     await bot.start(bot_token=BOT_TOKEN)
 
     PW = await async_playwright().start()
