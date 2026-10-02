@@ -13,10 +13,11 @@ API_HASH = 'f86b0b388670f1024e579b43e4eacaed'
 BOT_TOKEN = '7804873166:AAGuTs5EoeYTSQZsFW8z2OpOO4t60IQD1PM'
 ADMIN_ID = [5544288619]
 
-SCAN_DEADLINE = 45           # 1GB profile → ဖြတ်စရာ မြန်မြန်ဖြတ်
-MAX_CONCURRENT_SCANS = 1     # 1GB → 1 ခုပဲ safe
+SCAN_DEADLINE = 45
+MAX_CONCURRENT_SCANS = 1
 
-bot = TelegramClient('scanner_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# connect မလုပ်သေးဘူး — object ပဲ ဖန်တီးထားတယ် (loop fix)
+bot = TelegramClient('scanner_bot', API_ID, API_HASH)
 SEM = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
 PW = None
 BROWSER = None
@@ -137,7 +138,6 @@ SECURE_3D_SIGS = ["3d_secure", "3dsecure", "requires_action", "cardinalcommerce"
 
 # ── detection layer ─────────────────────────────────────
 def _find(blob: dict, table: dict) -> list:
-    """per-provider independent check — first-hit bug မရှိတော့ဘူး"""
     out = []
     for name, sigs in table.items():
         if any(s in blob["req"] for s in sigs):
@@ -340,6 +340,10 @@ async def start(event):
 
 async def main():
     global PW, BROWSER
+
+    # loop fix — connect ကို ဒီထဲမှာပဲ လုပ်တယ်
+    await bot.start(bot_token=BOT_TOKEN)
+
     PW = await async_playwright().start()
     BROWSER = await PW.chromium.launch(
         headless=True,
